@@ -81,7 +81,7 @@ ipykernel
 
 ### 安装命令
 ```bash
-pip install pandas==2.2.3 pyarrow==19.0.1 scikit-learn xgboost lightgbm numpy matplotlib seaborn jupyter ipykernel -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install pandas==2.2.3 pyarrow==19.0.1 scikit-learn xgboost lightgbm numpy matplotlib seaborn jupyter imbalanced-learn ipykernel -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 ### Jupyter Kernel 配置
