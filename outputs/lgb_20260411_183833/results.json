@@ -1,0 +1,31 @@
+{
+  "config": {
+    "model_name": "lightgbm",
+    "n_estimators": 100,
+    "num_leaves": 31,
+    "learning_rate": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "class_weight": "balanced",
+    "early_stopping_rounds": 10
+  },
+  "train_metrics": {
+    "auc": 0.997356134330877,
+    "logloss": 0.4789181947597901,
+    "accuracy": 0.9471428571428572
+  },
+  "val_metrics": {
+    "auc": 0.47916666666666663,
+    "logloss": 0.5826554182845441,
+    "accuracy": 0.78
+  },
+  "test_metrics": {
+    "auc": 0.6482285714285715,
+    "logloss": 0.5620219354140163,
+    "accuracy": 0.805
+  },
+  "feature_count": 207,
+  "train_size": 700,
+  "val_size": 100,
+  "test_size": 200
+}

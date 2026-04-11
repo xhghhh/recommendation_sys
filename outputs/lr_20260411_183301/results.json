@@ -1,0 +1,30 @@
+{
+  "config": {
+    "model_name": "logistic_regression",
+    "C": 1.0,
+    "penalty": "l2",
+    "max_iter": 1000,
+    "class_weight": "balanced",
+    "feature_selection": true,
+    "k_best": 50
+  },
+  "train_metrics": {
+    "auc": 0.6496971742513735,
+    "logloss": 0.6525639507657517,
+    "accuracy": 0.6728571428571428
+  },
+  "val_metrics": {
+    "auc": 0.4337121212121212,
+    "logloss": 0.7153785013589236,
+    "accuracy": 0.62
+  },
+  "test_metrics": {
+    "auc": 0.40914285714285714,
+    "logloss": 0.6964334295540823,
+    "accuracy": 0.6
+  },
+  "feature_count": 207,
+  "train_size": 700,
+  "val_size": 100,
+  "test_size": 200
+}

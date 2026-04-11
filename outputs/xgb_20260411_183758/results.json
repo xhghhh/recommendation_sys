@@ -1,0 +1,30 @@
+{
+  "config": {
+    "model_name": "xgboost",
+    "n_estimators": 100,
+    "max_depth": 6,
+    "learning_rate": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "early_stopping_rounds": 10
+  },
+  "train_metrics": {
+    "auc": 1.0,
+    "logloss": 0.023515918240406424,
+    "accuracy": 1.0
+  },
+  "val_metrics": {
+    "auc": 0.5530303030303031,
+    "logloss": 0.49005725958574303,
+    "accuracy": 0.88
+  },
+  "test_metrics": {
+    "auc": 0.7126857142857143,
+    "logloss": 0.4149483069959495,
+    "accuracy": 0.875
+  },
+  "feature_count": 207,
+  "train_size": 700,
+  "val_size": 100,
+  "test_size": 200
+}

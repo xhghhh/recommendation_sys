@@ -1,0 +1,16 @@
+{
+  "train_losses": [],
+  "val_losses": [],
+  "train_metrics": {
+    "auc": 0.997356134330877,
+    "logloss": 0.4789181947597901,
+    "accuracy": 0.9471428571428572
+  },
+  "val_metrics": {
+    "auc": 0.47916666666666663,
+    "logloss": 0.5826554182845441,
+    "accuracy": 0.78
+  },
+  "epochs": [],
+  "best_iteration": 5
+}
