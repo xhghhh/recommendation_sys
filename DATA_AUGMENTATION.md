@@ -239,5 +239,4 @@ augmented_label = alpha * label1 + (1-alpha) * label2  # 软标签
 
 ---
 
-*文档创建时间: 2024年*
 *适用数据集: TAAC2026 Demo Dataset*
