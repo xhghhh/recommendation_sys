@@ -153,6 +153,8 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         """
         Args:
@@ -170,6 +172,10 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            rank: DDP rank (0 for single-process). Each rank only iterates
+                over ``i % world_size == rank`` Row Groups so that no two
+                ranks see the same data within an epoch.
+            world_size: total number of DDP processes (1 for single-process).
         """
         super().__init__()
 
@@ -202,6 +208,15 @@ class PCVRParquetDataset(IterableDataset):
         if row_group_range is not None:
             start, end = row_group_range
             self._rg_list = self._rg_list[start:end]
+
+        # DDP rank slicing: each rank only sees a strided subset of Row Groups
+        # so that across an epoch the union of all ranks covers the full set
+        # exactly once. Worker-level slicing happens later inside __iter__.
+        self.rank: int = rank
+        self.world_size: int = world_size
+        if world_size > 1:
+            self._rg_list = [rg for i, rg in enumerate(self._rg_list)
+                             if i % world_size == rank]
 
         self.num_rows = sum(r[2] for r in self._rg_list)
 
@@ -681,6 +696,8 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    rank: int = 0,
+    world_size: int = 1,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -738,6 +755,8 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        rank=rank,
+        world_size=world_size,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -760,13 +779,19 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        # Validation only runs on rank-0 (see Trainer._evaluate_distributed),
+        # so do NOT shard the valid set; rank-0 must see the full split.
+        rank=0,
+        world_size=1,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
         num_workers=0, pin_memory=use_cuda,
     )
 
-    logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
+    logging.info(f"Parquet train: {train_rows} rows (per-rank: {train_dataset.num_rows} rows, "
+                 f"world_size={world_size}, rank={rank}), "
+                 f"valid: {valid_rows} rows, "
                  f"batch_size={batch_size}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset

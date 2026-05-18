@@ -6,6 +6,7 @@ uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 
 import os
 import glob
+import math
 import shutil
 import logging
 from typing import Any, Dict, Optional, Tuple
@@ -58,8 +59,20 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        rank: int = 0,
+        world_size: int = 1,
+        warmup_steps: int = 0,
+        grad_accum_steps: int = 1,
     ) -> None:
         self.model: nn.Module = model
+        # Unwrap DDP to access custom attrs/methods (get_sparse_params, predict,
+        # reinit_high_cardinality_params, num_ns, ...).
+        self._raw_model: nn.Module = (
+            model.module if hasattr(model, 'module') else model
+        )
+        self.rank: int = rank
+        self.world_size: int = world_size
+        self.is_main: bool = (rank == 0)
         self.train_loader: DataLoader = train_loader
         self.valid_loader: DataLoader = valid_loader
         self.writer = writer
@@ -73,10 +86,11 @@ class PCVRHyFormerRankingTrainer:
         self.ns_groups_path: Optional[str] = ns_groups_path
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
+        # Use the unwrapped (raw) model so DDP wrapping does not hide custom methods.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
-        if hasattr(model, 'get_sparse_params'):
-            sparse_params = model.get_sparse_params()
-            dense_params = model.get_dense_params()
+        if hasattr(self._raw_model, 'get_sparse_params'):
+            sparse_params = self._raw_model.get_sparse_params()
+            dense_params = self._raw_model.get_dense_params()
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -107,10 +121,48 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.warmup_steps: int = warmup_steps
+        self.grad_accum_steps: int = max(1, grad_accum_steps)
+        self._accum_step: int = 0
+        self._accum_loss_sum: float = 0.0
+
+        # ---- Learning rate scheduler (Cosine with Linear Warmup) ----
+        self.dense_scheduler: Optional[Any] = None
+        if warmup_steps > 0 or self.num_epochs > 0:
+            # Estimate total training steps for cosine decay.
+            # This is a rough estimate; the scheduler works fine even if
+            # the actual step count differs.
+            try:
+                steps_per_epoch = len(self.train_loader)
+            except TypeError:
+                steps_per_epoch = 1000  # IterableDataset fallback
+            total_steps = steps_per_epoch * self.num_epochs
+            self.dense_scheduler = self._build_cosine_scheduler(
+                self.dense_optimizer, warmup_steps, total_steps
+            )
+            logging.info(f"LR scheduler: CosineAnnealing with warmup_steps={warmup_steps}, "
+                         f"estimated total_steps={total_steps}")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                     f"warmup_steps={warmup_steps}, grad_accum_steps={self.grad_accum_steps}")
+
+    @staticmethod
+    def _build_cosine_scheduler(
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        total_steps: int,
+    ) -> torch.optim.lr_scheduler.LambdaLR:
+        """Build a CosineAnnealing scheduler with optional linear warmup."""
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            if total_steps <= warmup_steps:
+                return 1.0
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -189,7 +241,7 @@ class PCVRHyFormerRankingTrainer:
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            torch.save(self._raw_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
@@ -214,6 +266,20 @@ class PCVRHyFormerRankingTrainer:
             else:
                 device_batch[k] = v
         return device_batch
+
+    def _broadcast_early_stop(self) -> None:
+        """In DDP, broadcast rank-0's early_stop flag to all ranks so every
+        process exits the training loop together. No-op for single-process.
+        """
+        if self.world_size <= 1:
+            return
+        import torch.distributed as dist
+        flag = torch.tensor(
+            [1 if self.early_stopping.early_stop else 0],
+            dtype=torch.long, device=self.device,
+        )
+        dist.broadcast(flag, src=0)
+        self.early_stopping.early_stop = bool(flag.item())
 
     def _handle_validation_result(
         self,
@@ -252,7 +318,7 @@ class PCVRHyFormerRankingTrainer:
         if not is_likely_new_best:
             # No new best anticipated: leave disk untouched. The previous
             # best_model dir (with its model.pt + sidecars) remains valid.
-            self.early_stopping(val_auc, self.model, {
+            self.early_stopping(val_auc, self._raw_model, {
                 "best_val_AUC": val_auc,
                 "best_val_logloss": val_logloss,
             })
@@ -271,7 +337,7 @@ class PCVRHyFormerRankingTrainer:
         # I/O needed when a new best is confirmed.
         self._remove_old_best_dirs()
 
-        self.early_stopping(val_auc, self.model, {
+        self.early_stopping(val_auc, self._raw_model, {
             "best_val_AUC": val_auc,
             "best_val_logloss": val_logloss,
         })
@@ -291,60 +357,87 @@ class PCVRHyFormerRankingTrainer:
         epoch-level validation, triggers EarlyStopping and the periodic sparse
         re-initialization strategy.
         """
-        print("Start training (PCVRHyFormer)")
+        if self.is_main:
+            print("Start training (PCVRHyFormer)")
         self.model.train()
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
-                              dynamic_ncols=True)
+                              dynamic_ncols=True, disable=not self.is_main)
             loss_sum = 0.0
 
             for step, batch in train_pbar:
                 loss = self._train_step(batch)
                 total_step += 1
-                loss_sum += loss
+
+                # ---- Gradient accumulation ----
+                self._accum_loss_sum += loss
+                self._accum_step += 1
+                if self._accum_step < self.grad_accum_steps:
+                    # Skip optimizer step; accumulate more gradients.
+                    continue
+
+                # Flush accumulated gradients.
+                avg_loss = self._accum_loss_sum / self._accum_step
+                loss_sum += avg_loss
+                self._accum_loss_sum = 0.0
+                self._accum_step = 0
+
+                # Step optimizers + scheduler after accumulating enough micro-steps.
+                if self.grad_accum_steps > 1:
+                    self.dense_optimizer.step()
+                    if self.sparse_optimizer is not None:
+                        self.sparse_optimizer.step()
+                    if self.dense_scheduler is not None:
+                        self.dense_scheduler.step()
 
                 if self.writer:
-                    self.writer.add_scalar('Loss/train', loss, total_step)
+                    self.writer.add_scalar('Loss/train', avg_loss, total_step)
 
-                train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                train_pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
-                    logging.info(f"Evaluating at step {total_step}")
-                    val_auc, val_logloss = self.evaluate(epoch=epoch)
+                    if self.is_main:
+                        logging.info(f"Evaluating at step {total_step}")
+                    val_auc, val_logloss = self._evaluate_distributed(epoch=epoch)
                     self.model.train()
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                    logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+                    if self.is_main:
+                        logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+                        if self.writer:
+                            self.writer.add_scalar('AUC/valid', val_auc, total_step)
+                            self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
+                        self._handle_validation_result(total_step, val_auc, val_logloss)
 
-                    if self.writer:
-                        self.writer.add_scalar('AUC/valid', val_auc, total_step)
-                        self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
-
-                    self._handle_validation_result(total_step, val_auc, val_logloss)
-
+                    self._broadcast_early_stop()
                     if self.early_stopping.early_stop:
-                        logging.info(f"Early stopping at step {total_step}")
+                        if self.is_main:
+                            logging.info(f"Early stopping at step {total_step}")
                         return
 
-            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
+            if self.is_main:
+                logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / max(1, len(self.train_loader))}")
 
-            val_auc, val_logloss = self.evaluate(epoch=epoch)
+            val_auc, val_logloss = self._evaluate_distributed(epoch=epoch)
             self.model.train()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+            if self.is_main:
+                logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+                if self.writer:
+                    self.writer.add_scalar('AUC/valid', val_auc, total_step)
+                    self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
+                self._handle_validation_result(total_step, val_auc, val_logloss)
 
-            if self.writer:
-                self.writer.add_scalar('AUC/valid', val_auc, total_step)
-                self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
-
-            self._handle_validation_result(total_step, val_auc, val_logloss)
-
+            self._broadcast_early_stop()
             if self.early_stopping.early_stop:
-                logging.info(f"Early stopping at epoch {epoch}")
+                if self.is_main:
+                    logging.info(f"Early stopping at epoch {epoch}")
                 break
 
             # After the configured epoch, reinitialize high-cardinality sparse
@@ -361,8 +454,8 @@ class PCVRHyFormerRankingTrainer:
                         if p.data_ptr() in self.sparse_optimizer.state:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
-                reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
-                sparse_params = self.model.get_sparse_params()
+                reinit_ptrs = self._raw_model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
+                sparse_params = self._raw_model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
@@ -400,7 +493,13 @@ class PCVRHyFormerRankingTrainer:
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
-        """Run a single training step and return the scalar loss value."""
+        """Run a single forward-backward pass and return the scalar loss value.
+
+        The optimizer step is performed here only when gradient accumulation
+        is disabled (``grad_accum_steps == 1``).  When accumulation is active,
+        the caller (``train()``) is responsible for flushing gradients once
+        ``_accum_step >= grad_accum_steps``.
+        """
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
@@ -416,16 +515,44 @@ class PCVRHyFormerRankingTrainer:
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
+
+        # Scale loss for gradient accumulation.
+        if self.grad_accum_steps > 1:
+            loss = loss / self.grad_accum_steps
+
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+        # Single-step mode: step optimizers immediately.
+        if self.grad_accum_steps == 1:
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
+            if self.dense_scheduler is not None:
+                self.dense_scheduler.step()
 
-        return loss.item()
+        # Return the *unscaled* loss for logging.
+        return loss.item() * self.grad_accum_steps
+
+    def _evaluate_distributed(self, epoch: Optional[int] = None) -> Tuple[float, float]:
+        """Run validation only on rank-0 in DDP, with all other ranks blocking
+        on a barrier so they remain in sync. Single-process callers fall
+        through to ``evaluate``.
+        """
+        if self.world_size <= 1:
+            return self.evaluate(epoch=epoch)
+        import torch.distributed as dist
+        if self.is_main:
+            val_auc, val_logloss = self.evaluate(epoch=epoch)
+        else:
+            val_auc, val_logloss = 0.0, 0.0
+        # Use a CUDA tensor for barrier+broadcast under nccl backend.
+        metrics = torch.tensor([val_auc, val_logloss], dtype=torch.float32,
+                               device=self.device)
+        dist.broadcast(metrics, src=0)
+        return float(metrics[0].item()), float(metrics[1].item())
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
@@ -488,7 +615,7 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        logits, _ = self._raw_model.predict(model_input)  # (B, 1), (B, D)
         logits = logits.squeeze(-1)  # (B,)
 
         return logits, label

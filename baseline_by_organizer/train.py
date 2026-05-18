@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of training Row Groups to use (takes the first N%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
-    parser.add_argument('--eval_every_n_steps', type=int, default=0,
+    parser.add_argument('--eval_every_n_steps', type=int, default=1000,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
     parser.add_argument('--seq_max_lens', type=str,
@@ -204,6 +204,31 @@ def parse_args() -> argparse.Namespace:
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
 
+    # User-item interaction & inter-sequence attention.
+    parser.add_argument('--num_user_seqs', type=int, default=2,
+                        help='Number of user-side sequence domains (the first N '
+                             'domains in sorted order). Remaining domains are '
+                             'treated as item-side. Used by UserItemCrossAttention.')
+    parser.add_argument('--use_user_item_cross_attn', action='store_true', default=True,
+                        help='Enable bidirectional user-item cross-attention '
+                             'after the HyFormer block stack')
+    parser.add_argument('--no_user_item_cross_attn', dest='use_user_item_cross_attn',
+                        action='store_false',
+                        help='Disable user-item cross-attention')
+    parser.add_argument('--use_inter_seq_attn', action='store_true', default=True,
+                        help='Enable inter-sequence self-attention over all Q tokens')
+    parser.add_argument('--no_inter_seq_attn', dest='use_inter_seq_attn',
+                        action='store_false',
+                        help='Disable inter-sequence self-attention')
+
+    # Learning rate scheduling.
+    parser.add_argument('--warmup_steps', type=int, default=1000,
+                        help='Number of linear warmup steps for the dense optimizer '
+                             '(0 = no warmup)')
+    parser.add_argument('--grad_accum_steps', type=int, default=1,
+                        help='Gradient accumulation steps. Effective batch size = '
+                             'batch_size * grad_accum_steps')
+
     args = parser.parse_args()
 
     # Debug mode overrides: use local demo data and small defaults.
@@ -258,8 +283,39 @@ def main() -> None:
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
 
+    # ---- DDP setup (auto-detect torchrun env) ----
+    ddp_env = ('RANK' in os.environ and 'WORLD_SIZE' in os.environ
+               and 'LOCAL_RANK' in os.environ)
+    if ddp_env:
+        import torch.distributed as dist
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            args.device = f'cuda:{local_rank}'
+            backend = 'nccl'
+        else:
+            args.device = 'cpu'
+            backend = 'gloo'
+        dist.init_process_group(backend=backend)
+        logging.info(
+            f"DDP enabled | rank={rank} local_rank={local_rank} "
+            f"world_size={world_size} backend={backend} device={args.device}"
+        )
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        logging.info("DDP disabled (single-process training)")
+    args.rank = rank
+    args.local_rank = local_rank
+    args.world_size = world_size
+    is_main = (rank == 0)
+
+    # Only rank-0 writes TensorBoard events to avoid duplicate writers.
     from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(args.tf_events_dir)
+    writer = SummaryWriter(args.tf_events_dir) if is_main else None
 
     # ---- Data loading ----
     if args.schema_path:
@@ -294,6 +350,8 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        rank=rank,
+        world_size=world_size,
     )
 
     # ---- Dataset size diagnostics ----
@@ -362,11 +420,14 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "num_user_seqs": args.num_user_seqs,
+        "use_user_item_cross_attn": args.use_user_item_cross_attn,
+        "use_inter_seq_attn": args.use_inter_seq_attn,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
 
-    # Log model sizing info.
+    # Log model sizing info BEFORE DDP wrap (DDP hides custom attrs behind .module).
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
@@ -375,6 +436,21 @@ def main() -> None:
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Total parameters: {total_params:,}")
+
+    # Wrap with DDP if launched via torchrun (>=2 processes).
+    if ddp_env and world_size > 1:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        # find_unused_parameters=True: PCVRHyFormer has conditional code paths
+        # (e.g. domain-specific seq encoders) where some params may not
+        # contribute to a given step's loss; setting True avoids DDP
+        # 'unused parameter' errors at the small cost of an extra reduce.
+        model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=True,
+        )
+        logging.info(f"Wrapped model with DistributedDataParallel (device_ids=[{local_rank}])")
 
     # ---- Training ----
     early_stopping = EarlyStopping(
@@ -411,10 +487,20 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        rank=rank,
+        world_size=world_size,
+        warmup_steps=args.warmup_steps,
+        grad_accum_steps=args.grad_accum_steps,
     )
 
     trainer.train()
-    writer.close()
+    if writer is not None:
+        writer.close()
+
+    if ddp_env:
+        import torch.distributed as dist
+        dist.barrier()
+        dist.destroy_process_group()
 
     logging.info("Training complete!")
 

@@ -1189,6 +1189,95 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class UserItemCrossAttention(nn.Module):
+    """Bidirectional cross-attention between user-side and item-side tokens.
+
+    User tokens attend to item tokens (and vice-versa) via two independent
+    CrossAttention modules. A learnable gate controls how much cross-side
+    information is blended in, which helps training stability in the early
+    stages when the attention weights are essentially random.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.user_to_item = CrossAttention(
+            d_model=d_model, num_heads=num_heads,
+            dropout=dropout, ln_mode='pre',
+        )
+        self.item_to_user = CrossAttention(
+            d_model=d_model, num_heads=num_heads,
+            dropout=dropout, ln_mode='pre',
+        )
+        # Learnable gate initialised near zero so the cross-attention starts
+        # as a near-identity and ramps up as training progresses.
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        user_tokens: torch.Tensor,
+        item_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply bidirectional cross-attention.
+
+        Args:
+            user_tokens: (B, Tu, D)
+            item_tokens: (B, Ti, D)
+
+        Returns:
+            (updated_user_tokens, updated_item_tokens)
+        """
+        user_out = self.user_to_item(user_tokens, item_tokens)
+        item_out = self.item_to_user(item_tokens, user_tokens)
+        g = torch.sigmoid(self.gate)
+        return (
+            user_tokens * (1 - g) + user_out * g,
+            item_tokens * (1 - g) + item_out * g,
+        )
+
+
+class InterSequenceSelfAttention(nn.Module):
+    """Self-attention over the concatenated Q tokens of all sequence domains.
+
+    Allows different sequence domains to exchange information via standard
+    multi-head self-attention, complementary to the parameter-free RankMixer
+    token mixing.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.self_attn = RoPEMultiheadAttention(
+            d_model=d_model, num_heads=num_heads,
+            dropout=dropout, rope_on_q=False,
+        )
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Apply self-attention with gated residual.
+
+        Args:
+            tokens: (B, T, D) concatenated Q tokens from all sequences.
+
+        Returns:
+            Updated tokens of the same shape.
+        """
+        residual = tokens
+        x = self.norm(tokens)
+        out, _ = self.self_attn(query=x, key=x, value=x)
+        g = torch.sigmoid(self.gate)
+        return residual * (1 - g) + out * g
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1318,11 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # User-item interaction
+        num_user_seqs: int = 2,
+        use_user_item_cross_attn: bool = True,
+        # Inter-sequence self-attention
+        use_inter_seq_attn: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1338,9 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.num_user_seqs = num_user_seqs
+        self.use_user_item_cross_attn = use_user_item_cross_attn
+        self.use_inter_seq_attn = use_inter_seq_attn
 
         # ================== NS Tokens Construction ==================
 
@@ -1411,6 +1508,21 @@ class PCVRHyFormer(nn.Module):
             self.rotary_emb = RotaryEmbedding(dim=head_dim, base=rope_base)
         else:
             self.rotary_emb = None
+
+        # ================== User-Item Cross Attention ==================
+        if use_user_item_cross_attn:
+            self.user_item_cross_attn = UserItemCrossAttention(
+                d_model=d_model, num_heads=num_heads, dropout=dropout_rate,
+            )
+            logging.info(f"UserItemCrossAttention enabled: "
+                         f"user_seqs={num_user_seqs}, item_seqs={self.num_sequences - num_user_seqs}")
+
+        # ================== Inter-Sequence Self Attention ==================
+        if use_inter_seq_attn:
+            self.inter_seq_attn = InterSequenceSelfAttention(
+                d_model=d_model, num_heads=num_heads, dropout=dropout_rate,
+            )
+            logging.info(f"InterSequenceSelfAttention enabled over {T} Q tokens")
 
         # Output projection
         self.output_proj = nn.Sequential(
@@ -1581,15 +1693,18 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
-    def _run_multi_seq_blocks(
+    def _run_blocks(
         self,
         q_tokens_list: list,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
         apply_dropout: bool = True
-    ) -> torch.Tensor:
-        """Runs the multi-sequence block stack with dropout and output projection."""
+    ) -> Tuple[list, torch.Tensor]:
+        """Run the multi-sequence block stack.
+
+        Returns (q_tokens_list, ns_tokens) after all blocks.
+        """
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
@@ -1623,12 +1738,50 @@ class PCVRHyFormer(nn.Module):
                 rope_sin_list=rope_sin_list,
             )
 
-        # Output: concatenate all sequences' Q tokens then project via MLP
+        return curr_qs, curr_ns
+
+    def _compute_output(
+        self,
+        curr_qs: list,
+    ) -> torch.Tensor:
+        """Apply cross-attention layers, output projection, and return logits-ready embedding.
+
+        Args:
+            curr_qs: list of (B, Nq, D) Q-token tensors, one per sequence domain.
+
+        Returns:
+            (B, d_model) output embedding.
+        """
+        # ---- User-Item Cross Attention ----
+        if self.use_user_item_cross_attn:
+            n_u = self.num_user_seqs
+            user_q = torch.cat(curr_qs[:n_u], dim=1)   # (B, Nq*n_u, D)
+            item_q = torch.cat(curr_qs[n_u:], dim=1)   # (B, Nq*(S-n_u), D)
+            user_q, item_q = self.user_item_cross_attn(user_q, item_q)
+            # Write back into curr_qs
+            offset = 0
+            for i in range(n_u):
+                curr_qs[i] = user_q[:, offset:offset + self.num_queries, :]
+                offset += self.num_queries
+            offset = 0
+            for i in range(n_u, len(curr_qs)):
+                curr_qs[i] = item_q[:, offset:offset + self.num_queries, :]
+                offset += self.num_queries
+
+        # ---- Inter-Sequence Self Attention ----
+        if self.use_inter_seq_attn:
+            all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
+            all_q = self.inter_seq_attn(all_q)
+            offset = 0
+            for i in range(len(curr_qs)):
+                curr_qs[i] = all_q[:, offset:offset + self.num_queries, :]
+                offset += self.num_queries
+
+        # ---- Output projection ----
         B = curr_qs[0].shape[0]
         all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
         output = all_q.view(B, -1)  # (B, Nq*S*D)
         output = self.output_proj(output)  # (B, D)
-
         return output
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
@@ -1664,13 +1817,16 @@ class PCVRHyFormer(nn.Module):
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output = self._run_multi_seq_blocks(
+        # 4. Dropout + MultiSeqHyFormerBlock stack
+        curr_qs, curr_ns = self._run_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
 
-        # 5. Classifier
+        # 5. Cross-attention + output projection
+        output = self._compute_output(curr_qs)
+
+        # 6. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
 
@@ -1705,10 +1861,12 @@ class PCVRHyFormer(nn.Module):
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        output = self._run_multi_seq_blocks(
+        curr_qs, curr_ns = self._run_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        output = self._compute_output(curr_qs)
 
         logits = self.clsfier(output)
         return logits, output
