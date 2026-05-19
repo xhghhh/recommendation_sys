@@ -48,14 +48,14 @@ logging.basicConfig(
 # When the feature is enabled we therefore use the constant exposed by the
 # dataset module; ``0`` means disabled.
 _FALLBACK_MODEL_CFG = {
-    'd_model': 128,
-    'emb_dim': 128,
+    'd_model': 96,
+    'emb_dim': 96,
     'num_queries': 2,
-    'num_hyformer_blocks': 3,
+    'num_hyformer_blocks': 2,
     'num_heads': 4,
     'seq_encoder_type': 'transformer',
     'hidden_mult': 4,
-    'dropout_rate': 0.01,
+    'dropout_rate': 0.05,
     'seq_top_k': 50,
     'seq_causal': False,
     'action_num': 1,
@@ -71,6 +71,9 @@ _FALLBACK_MODEL_CFG = {
     'num_user_seqs': 2,
     'use_user_item_cross_attn': True,
     'use_inter_seq_attn': True,
+    'use_user_vq': True,
+    'vq_codebook_size': 256,
+    'vq_commitment_cost': 0.25,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

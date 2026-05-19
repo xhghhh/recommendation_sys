@@ -155,6 +155,10 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         rank: int = 0,
         world_size: int = 1,
+        # Dense feature augmentation
+        aug_dense_ratio: float = 0.0,
+        aug_dense_noise_std: float = 0.1,
+        aug_dense_scale_range: float = 0.1,
     ) -> None:
         """
         Args:
@@ -219,6 +223,11 @@ class PCVRParquetDataset(IterableDataset):
                              if i % world_size == rank]
 
         self.num_rows = sum(r[2] for r in self._rg_list)
+
+        # ---- Dense feature augmentation config ----
+        self.aug_dense_ratio: float = aug_dense_ratio
+        self.aug_dense_noise_std: float = aug_dense_noise_std
+        self.aug_dense_scale_range: float = aug_dense_scale_range
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
@@ -344,6 +353,37 @@ class PCVRParquetDataset(IterableDataset):
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
 
+    def _augment_dense_batch(
+        self,
+        batch_dict: Dict[str, Any],
+        aug_count: int,
+    ) -> List[Dict[str, Any]]:
+        """Create ``aug_count`` augmented copies of a batch by adding Gaussian
+        noise and random scaling to user_dense_feats (and item_dense_feats if
+        non-empty).
+
+        Only the dense features are perturbed; int features, labels, sequences
+        etc. are kept identical so the augmented sample retains the same label
+        with slightly different dense inputs — a classic regularisation trick.
+        """
+        copies = []
+        for _ in range(aug_count):
+            aug = {k: v for k, v in batch_dict.items()}
+            for key in ('user_dense_feats', 'item_dense_feats'):
+                feat = batch_dict[key]
+                if feat.numel() == 0:
+                    continue
+                # Gaussian noise
+                noise = torch.randn_like(feat) * self.aug_dense_noise_std
+                # Random scaling per-row: each row gets a scale factor sampled
+                # uniformly from [1 - scale_range, 1 + scale_range].
+                scale = 1.0 + (torch.rand(feat.shape[0], 1, dtype=feat.dtype)
+                               * 2 * self.aug_dense_scale_range
+                               - self.aug_dense_scale_range)
+                aug[key] = feat * scale + noise
+            copies.append(aug)
+        return copies
+
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
         return sum((n + self.batch_size - 1) // self.batch_size
@@ -361,6 +401,37 @@ class PCVRParquetDataset(IterableDataset):
             pf = pq.ParquetFile(file_path)
             for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
                 batch_dict = self._convert_batch(batch)
+
+                # Dense feature augmentation: yield augmented copies as
+                # separate batch_dicts so each batch stays at batch_size rows
+                # (avoids doubling buffer memory usage).
+                #
+                # aug_dense_ratio is a float in [0, 1]: the fraction of the
+                # batch to augment.  For example, ratio=0.5 means augment 50%
+                # of rows in each batch.
+                if self.is_training and self.aug_dense_ratio > 0:
+                    B = batch_dict['label'].shape[0]
+                    n_aug = int(B * self.aug_dense_ratio)  # rows to augment
+                    if n_aug > 0:
+                        # Slice out the portion to augment
+                        aug_slice_dict = {k: v[:n_aug] if isinstance(v, torch.Tensor) else v
+                                          for k, v in batch_dict.items()}
+                        # Keep the non-augmented portion as-is
+                        remaining_dict = {k: v[n_aug:] if isinstance(v, torch.Tensor) else v
+                                          for k, v in batch_dict.items()}
+                        # Generate one augmented copy of the sliced portion
+                        aug_copies = self._augment_dense_batch(aug_slice_dict, aug_count=1)
+                        # Yield/buffer: original remaining + augmented slice
+                        for bd in [remaining_dict] + aug_copies:
+                            if self.shuffle and self.buffer_batches > 1:
+                                buffer.append(bd)
+                                if len(buffer) >= self.buffer_batches:
+                                    yield from self._flush_buffer(buffer)
+                                    buffer = []
+                            else:
+                                yield bd
+                        continue  # Already handled above
+
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
                     if len(buffer) >= self.buffer_batches:
@@ -698,6 +769,10 @@ def get_pcvr_data(
     seq_max_lens: Optional[Dict[str, int]] = None,
     rank: int = 0,
     world_size: int = 1,
+    # Dense feature augmentation
+    aug_dense_ratio: float = 0.0,
+    aug_dense_noise_std: float = 0.1,
+    aug_dense_scale_range: float = 0.1,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -757,6 +832,9 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         rank=rank,
         world_size=world_size,
+        aug_dense_ratio=aug_dense_ratio,
+        aug_dense_noise_std=aug_dense_noise_std,
+        aug_dense_scale_range=aug_dense_scale_range,
     )
 
     use_cuda = torch.cuda.is_available()

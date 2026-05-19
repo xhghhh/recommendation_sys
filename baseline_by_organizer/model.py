@@ -1189,6 +1189,78 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class VQEncoder(nn.Module):
+    """Vector Quantization encoder for user NS tokens.
+
+    Quantizes continuous token vectors to a learnable codebook, acting as a
+    strong regularizer that constrains user representations to a discrete set
+    of prototypes.  Uses the straight-through estimator so that gradients
+    flow through the (non-differentiable) argmin step.
+
+    Auxiliary losses:
+      - Commitment loss:  encourages encoder outputs to stay close to their
+        assigned codebook vectors.
+      - Codebook loss:    pulls the codebook vectors towards the encoder
+        outputs (equivalent to an EMA-style update when using the
+        gradient-based formulation).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        codebook_size: int = 256,
+        commitment_cost: float = 0.25,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.codebook_size = codebook_size
+        self.commitment_cost = commitment_cost
+
+        # Codebook: (K, D)
+        self.codebook = nn.Parameter(
+            torch.randn(codebook_size, d_model) * (1.0 / d_model)
+        )
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize input tokens via nearest-codebook lookup.
+
+        Args:
+            x: (B, T, D) continuous token tensor (e.g. user NS tokens).
+
+        Returns:
+            quantized: (B, T, D) quantized tokens (straight-through).
+            vq_loss: scalar tensor with commitment + codebook loss.
+        """
+        B, T, D = x.shape
+        K = self.codebook_size
+
+        # Flatten to (B*T, D) for efficient distance computation
+        x_flat = x.reshape(-1, D)  # (N, D) where N = B*T
+
+        # Compute squared L2 distances: ||z - e||^2 = ||z||^2 + ||e||^2 - 2*z*e^T
+        # x_flat: (N, D), codebook: (K, D)
+        x_sq = (x_flat ** 2).sum(dim=1, keepdim=True)       # (N, 1)
+        cb_sq = (self.codebook ** 2).sum(dim=1).unsqueeze(0) # (1, K)
+        dist = x_sq + cb_sq - 2 * x_flat @ self.codebook.t()  # (N, K)
+
+        # Nearest codebook entry
+        indices = dist.argmin(dim=1)  # (N,)
+        z_q = self.codebook[indices]  # (N, D)
+
+        # Straight-through estimator: copy gradient from z_q to x
+        quantized = x_flat + (z_q - x_flat).detach()
+        quantized = quantized.reshape(B, T, D)
+
+        # Auxiliary losses
+        commitment_loss = F.mse_loss(x_flat, z_q.detach())  # encoder -> codebook
+        codebook_loss = F.mse_loss(z_q, x_flat.detach())    # codebook -> encoder
+        vq_loss = commitment_loss * self.commitment_cost + codebook_loss
+
+        return quantized, vq_loss
+
+
 class UserItemCrossAttention(nn.Module):
     """Bidirectional cross-attention between user-side and item-side tokens.
 
@@ -1323,6 +1395,10 @@ class PCVRHyFormer(nn.Module):
         use_user_item_cross_attn: bool = True,
         # Inter-sequence self-attention
         use_inter_seq_attn: bool = True,
+        # User VQ regularization
+        use_user_vq: bool = False,
+        vq_codebook_size: int = 256,
+        vq_commitment_cost: float = 0.25,
     ) -> None:
         super().__init__()
 
@@ -1341,6 +1417,8 @@ class PCVRHyFormer(nn.Module):
         self.num_user_seqs = num_user_seqs
         self.use_user_item_cross_attn = use_user_item_cross_attn
         self.use_inter_seq_attn = use_inter_seq_attn
+        self.use_user_vq = use_user_vq
+        self._vq_loss: float = 0.0
 
         # ================== NS Tokens Construction ==================
 
@@ -1523,6 +1601,16 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model, num_heads=num_heads, dropout=dropout_rate,
             )
             logging.info(f"InterSequenceSelfAttention enabled over {T} Q tokens")
+
+        # ================== User VQ Encoder ==================
+        if use_user_vq:
+            self.user_vq = VQEncoder(
+                d_model=d_model,
+                codebook_size=vq_codebook_size,
+                commitment_cost=vq_commitment_cost,
+            )
+            logging.info(f"UserVQ enabled: codebook_size={vq_codebook_size}, "
+                         f"commitment_cost={vq_commitment_cost}")
 
         # Output projection
         self.output_proj = nn.Sequential(
@@ -1790,6 +1878,13 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
+        # User VQ: quantize user_ns to regularize user representations
+        if self.use_user_vq:
+            user_ns, vq_loss = self.user_vq(user_ns)
+            self._vq_loss = vq_loss
+        else:
+            self._vq_loss = 0.0
+
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
@@ -1835,6 +1930,10 @@ class PCVRHyFormer(nn.Module):
         # Reuses forward logic but without dropout
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+
+        # User VQ: apply quantization during inference too
+        if self.use_user_vq:
+            user_ns, _ = self.user_vq(user_ns)
 
         ns_parts = [user_ns]
         if self.has_user_dense:

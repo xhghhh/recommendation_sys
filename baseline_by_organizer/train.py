@@ -228,6 +228,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='Gradient accumulation steps. Effective batch size = '
                              'batch_size * grad_accum_steps')
+    parser.add_argument('--top_k_checkpoints', type=int, default=3,
+                        help='Number of top-k best checkpoints to keep on disk '
+                             '(ranked by validation AUC)')
+
+    # User VQ regularization.
+    parser.add_argument('--use_user_vq', action='store_true', default=False,
+                        help='Enable Vector Quantization on user NS tokens '
+                             'for regularization')
+    parser.add_argument('--no_user_vq', dest='use_user_vq', action='store_false',
+                        help='Disable user VQ')
+    parser.add_argument('--vq_codebook_size', type=int, default=256,
+                        help='Number of codebook vectors in the user VQ encoder')
+    parser.add_argument('--vq_commitment_cost', type=float, default=0.25,
+                        help='Commitment loss weight for user VQ '
+                             '(higher = stronger regularization)')
+
+    # Dense feature augmentation.
+    parser.add_argument('--aug_dense_ratio', type=float, default=0.0,
+                        help='Fraction of each training batch to augment via '
+                             'dense feature perturbation (0.0 = no augmentation, '
+                             '0.5 = augment 50% of rows, 1.0 = augment all rows)')
+    parser.add_argument('--aug_dense_noise_std', type=float, default=0.1,
+                        help='Gaussian noise std for dense feature augmentation')
+    parser.add_argument('--aug_dense_scale_range', type=float, default=0.1,
+                        help='Random scale range for dense feature augmentation '
+                             '(scale ~ Uniform[1-range, 1+range])')
 
     args = parser.parse_args()
 
@@ -352,6 +378,9 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
         rank=rank,
         world_size=world_size,
+        aug_dense_ratio=args.aug_dense_ratio,
+        aug_dense_noise_std=args.aug_dense_noise_std,
+        aug_dense_scale_range=args.aug_dense_scale_range,
     )
 
     # ---- Dataset size diagnostics ----
@@ -423,6 +452,9 @@ def main() -> None:
         "num_user_seqs": args.num_user_seqs,
         "use_user_item_cross_attn": args.use_user_item_cross_attn,
         "use_inter_seq_attn": args.use_inter_seq_attn,
+        "use_user_vq": args.use_user_vq,
+        "vq_codebook_size": args.vq_codebook_size,
+        "vq_commitment_cost": args.vq_commitment_cost,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -491,6 +523,7 @@ def main() -> None:
         world_size=world_size,
         warmup_steps=args.warmup_steps,
         grad_accum_steps=args.grad_accum_steps,
+        top_k_checkpoints=args.top_k_checkpoints,
     )
 
     trainer.train()

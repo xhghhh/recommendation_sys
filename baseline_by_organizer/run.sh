@@ -32,18 +32,27 @@ if [ "${NPROC_PER_NODE}" -gt 1 ]; then
         --ns_groups_json "" \
         --emb_skip_threshold 1000000 \
         --num_workers 8 \
-        --d_model 128 \
-        --emb_dim 128 \
-        --num_hyformer_blocks 3 \
-        --batch_size 128 \
+        --d_model 96 \
+        --emb_dim 96 \
+        --num_hyformer_blocks 2 \
+        --batch_size 256 \
         --use_rope \
         --loss_type focal \
         --focal_alpha 0.25 \
         --focal_gamma 2.0 \
-        --valid_ratio 0.05 \
-        --warmup_steps 1000 \
+        --valid_ratio 0.1 \
+        --lr 1e-6 \
+        --sparse_lr 0.01 \
+        --warmup_steps 2000 \
+        --dropout_rate 0.06 \
         --reinit_cardinality_threshold 50000 \
         --buffer_batches 50 \
+        --use_user_vq \
+        --vq_codebook_size 256 \
+        --vq_commitment_cost 0.25 \
+        --aug_dense_ratio 0.2 \
+        --aug_dense_noise_std 0.1 \
+        --aug_dense_scale_range 0.1 \
         "$@"
 else
     python3 -u "${SCRIPT_DIR}/train.py" \
@@ -54,18 +63,27 @@ else
         --ns_groups_json "" \
         --emb_skip_threshold 1000000 \
         --num_workers 8 \
-        --d_model 128 \
-        --emb_dim 128 \
-        --num_hyformer_blocks 3 \
-        --batch_size 128 \
+        --d_model 96 \
+        --emb_dim 96 \
+        --num_hyformer_blocks 2 \
+        --batch_size 256 \
         --use_rope \
         --loss_type focal \
         --focal_alpha 0.25 \
         --focal_gamma 2.0 \
-        --valid_ratio 0.05 \
-        --warmup_steps 1000 \
+        --valid_ratio 0.1 \
+        --lr 5e-5 \
+        --sparse_lr 0.01 \
+        --warmup_steps 2000 \
+        --dropout_rate 0.05 \
         --reinit_cardinality_threshold 50000 \
         --buffer_batches 50 \
+        --use_user_vq \
+        --vq_codebook_size 256 \
+        --vq_commitment_cost 0.25 \
+        --aug_dense_ratio 0.5 \
+        --aug_dense_noise_std 0.1 \
+        --aug_dense_scale_range 0.1 \
         "$@"
 fi
 
